@@ -112,6 +112,28 @@ If you use this pipeline or NSD data in a publication, cite the NSD papers and f
 
 ---
 
+## Push this code to a new GitHub repository
+
+1. Create an **empty** repository on GitHub (no README/license if you already have them locally), e.g. `your-username/nsd-prepare-pipeline`.
+
+2. On your machine:
+
+```bash
+cd /path/to/202604_R2_fmri_data   # this project folder
+
+# If you already ran `git init` here, skip init; ensure branch is main:
+git branch -M main
+
+git remote add origin https://github.com/YOUR_USERNAME/YOUR_REPO.git
+git push -u origin main
+```
+
+Use **SSH** if you prefer: `git@github.com:YOUR_USERNAME/YOUR_REPO.git`.
+
+3. **Never commit** `nsd_prepared/` or `nsd_tmp/` — they are listed in **`.gitignore`** and can be **tens to hundreds of GB**.
+
+---
+
 ## License
 
 This **repository** (script + docs) is provided as-is for research use. **NSD data** remain subject to the **NSD Data Access Agreement** and NSD’s terms — not replaced by any license in this repo.
