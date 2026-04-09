@@ -1,0 +1,29 @@
+# Conda environment for NSD preparation pipeline
+# Create/update:  conda env create -f environment.yml
+#                  conda env update -f environment.yml --prune
+# Activate:        conda activate fmri
+# Run:             python nsd_prepare_pipeline.py
+#
+# If you see: ImportError: cannot import name 'intp' from 'numpy._core'
+# your NumPy install is mixed/corrupt. Fix (pick one):
+#   conda activate fmri
+#   conda install -y -c conda-forge "numpy>=1.26,<2.1" "scipy" --force-reinstall
+#   # avoid: pip install numpy on top of conda numpy
+name: fmri
+channels:
+  - conda-forge
+dependencies:
+  - python>=3.8,<3.13
+  # Pin NumPy 1.x stack from conda-forge only — mixed pip+conda numpy breaks numpy._core
+  - numpy>=1.26,<2.1
+  - scipy
+  - pandas
+  - matplotlib
+  - pillow
+  - h5py
+  - nibabel
+  - nilearn
+  - opencv
+  - pip
+  - pip:
+    - awscli

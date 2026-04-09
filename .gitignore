@@ -1,0 +1,26 @@
+# Pipeline outputs (large — never commit)
+nsd_prepared/
+nsd_tmp/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+*.swp
+*.swo
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Logs / local AWS debug
+*.log
