@@ -795,8 +795,35 @@ def _aws_s3_download_bytes_on_disk(dst: Path) -> int:
     return total
 
 
+def _is_complete_stimulus_file(path: Path) -> bool:
+    if not path.exists() or not path.is_file():
+        return False
+    return path.stat().st_size >= _NSD_STIMULI_HDF5_BYTES * 0.999
+
+
+def _recover_complete_stimulus_file(dst: Path) -> bool:
+    """
+    If aws left a fully downloaded temp file like `dst.<random>`, recover it.
+    Returns True when a complete file is available at `dst` after this call.
+    """
+    if _is_complete_stimulus_file(dst):
+        return True
+    for p in sorted(dst.parent.glob(f"{dst.name}.*")):
+        if p.is_file() and _is_complete_stimulus_file(p):
+            print(f"[5.3] Found complete download in temp file {p.name}; moving to {dst.name}")
+            if dst.exists():
+                dst.unlink()
+            p.rename(dst)
+            return True
+    return False
+
+
 def download_stimuli_progress(src: str, dst: Path) -> None:
     dst.parent.mkdir(parents=True, exist_ok=True)
+    if _recover_complete_stimulus_file(dst):
+        got = dst.stat().st_size
+        print(f"[5.3] Reusing complete local stimulus file ({got / 1e9:.2f} GB).")
+        return
     # Resume / cleanup after Ctrl+C or failed run: remove AWS partial `dst.*` files
     # (a new `aws s3 cp` does not resume into them; leaving them wastes disk).
     for p in sorted(dst.parent.glob(f"{dst.name}.*")):
@@ -2017,10 +2044,14 @@ def main() -> None:
         with h5py.File(stim_out, "r") as sf:
             need_stim = sf["/images"].shape[0] != n_final
     if need_stim:
-        if not stim_raw.exists():
+        if not _recover_complete_stimulus_file(stim_raw):
             download_stimuli_progress(
                 f"{S3_BUCKET}/nsddata_stimuli/stimuli/nsd/nsd_stimuli.hdf5",
                 stim_raw,
+            )
+        else:
+            print(
+                f"[5.3] Found existing complete stimulus file at {stim_raw}; skipping download."
             )
         extract_stimuli_224(final_list, min_reps, n_final)
 
