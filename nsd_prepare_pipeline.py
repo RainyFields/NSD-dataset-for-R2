@@ -938,13 +938,68 @@ def extract_stimuli_224(
 ) -> None:
     out_path = PREP / "nsd_stimuli_224.hdf5"
     raw_path = TMP / "nsd_stimuli_raw.hdf5"
+
+    def _prepared_stim_ok(path: Path) -> bool:
+        """Validate prepared stimuli file; reject tiny/all-zero partial artifacts."""
+        if not path.exists():
+            return False
+        try:
+            with h5py.File(path, "r") as f:
+                if "/images" not in f:
+                    return False
+                d = f["/images"]
+                if d.shape != (n_final, 224, 224, 3):
+                    return False
+                if d.dtype != np.uint8:
+                    return False
+                # Sample a few images; reject if all are constant zeros.
+                probe_idx = [0, max(0, n_final // 2), max(0, n_final - 1)]
+                probe_sum = 0
+                for i in probe_idx:
+                    probe_sum += int(np.asarray(d[i]).sum())
+                if probe_sum == 0:
+                    return False
+        except OSError:
+            return False
+        # 1000 images at 224x224x3 should be far above a few MB; tiny file indicates partial write.
+        if path.stat().st_size < 10 * 1024 * 1024:
+            return False
+        return True
+
     if out_path.exists():
-        with h5py.File(out_path, "r") as f:
-            if f["/images"].shape[0] == n_final:
-                print(f"[5.4] Using existing {out_path}")
-                return
+        if _prepared_stim_ok(out_path):
+            print(f"[5.4] Using existing {out_path}")
+            return
+        print(f"[5.4] Existing {out_path.name} appears incomplete; rebuilding it.")
+        out_path.unlink()
     with h5py.File(raw_path, "r") as f_in:
         brick = f_in["/imgBrick"]
+        shape = tuple(brick.shape)
+        print(f"[5.4] /imgBrick shape={shape}, dtype={brick.dtype}")
+        if 73000 not in shape:
+            raise RuntimeError(f"Unexpected /imgBrick shape (no 73000 axis): {shape}")
+        img_axis = int(shape.index(73000))
+
+        def _read_img(g73k: int) -> np.ndarray:
+            """Return one RGB image as (H, W, 3), regardless of axis order."""
+            raw3 = np.take(brick, g73k, axis=img_axis)  # 3D
+            arr = np.asarray(raw3)
+            if arr.ndim != 3:
+                raise RuntimeError(
+                    f"Unexpected raw image ndim={arr.ndim} for g73k={g73k}, "
+                    f"shape={arr.shape}, brick_shape={shape}, img_axis={img_axis}"
+                )
+            if arr.shape[-1] == 3:
+                return arr
+            if arr.shape[0] == 3:
+                return np.moveaxis(arr, 0, -1)
+            if arr.shape[1] == 3:
+                return np.moveaxis(arr, 1, -1)
+            raise RuntimeError(
+                f"Could not locate channel axis (=3) for g73k={g73k}, "
+                f"raw shape={arr.shape}, brick_shape={shape}"
+            )
+
         with h5py.File(out_path, "w") as f_out:
             d = f_out.create_dataset(
                 "/images",
@@ -969,8 +1024,7 @@ def extract_stimuli_224(
             for batch_start in range(0, n_final, 500):
                 batch = final_list[batch_start : batch_start + 500]
                 for pos, g73k in enumerate(batch):
-                    raw = brick[:, :, :, g73k]
-                    img = np.asarray(raw).transpose(1, 2, 0)
+                    img = _read_img(int(g73k))
                     im = Image.fromarray(img)
                     im = im.resize((224, 224), Image.LANCZOS)
                     d[batch_start + pos] = np.asarray(im, dtype=np.uint8)
@@ -1222,19 +1276,28 @@ def process_subject_sessions(
 
 def verify_neural(
     aa: int, out_paths: Dict[str, Path], n_final: int, min_reps: int
-) -> None:
+) -> bool:
+    has_any_data = False
     for roi in ROI_ORDER:
         with h5py.File(out_paths[roi], "r") as f:
             b = f["/betas"][:]
         n_complete = int(np.sum(~np.isnan(b[:, -1, 0])))
         n_any_nan = int(np.sum(np.any(np.isnan(b), axis=(1, 2))))
         nan_frac = float(np.isnan(b).mean())
+        if np.any(~np.isnan(b)):
+            has_any_data = True
         print(
             f"  subj{aa:02d} {roi}: complete(last rep)={n_complete}/{n_final} "
             f"any_nan_rows={n_any_nan} nan_frac={nan_frac:.4f}"
         )
         if nan_frac > 0.05:
             print(f"WARNING: nan_frac > 0.05 for subj{aa:02d} {roi}")
+    if not has_any_data:
+        print(
+            f"ERROR: subj{aa:02d} neural files contain no non-NaN beta values. "
+            "Check session download logs and session discovery."
+        )
+    return has_any_data
 
 
 # =============================================================================
@@ -1942,12 +2005,19 @@ def parse_args() -> argparse.Namespace:
         help="Skip agreement/subject/MIN_REPS/ROI prompts; use MIN_REPS=3 and default ROIs. "
         "You must still comply with the NSD Data Access Agreement.",
     )
+    p.add_argument(
+        "--smoke-test",
+        action="store_true",
+        help="Run only lightweight stages and stop before large downloads "
+        "(exits after Part 4, before Part 5 stimulus download).",
+    )
     return p.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     ni = bool(args.non_interactive)
+    smoke = bool(args.smoke_test)
     setup_logging()
     print_part_disk("Part 0")
     ensure_aws_cli()
@@ -2035,6 +2105,14 @@ def main() -> None:
         "else Kastner2015 VO/PHC; else fallback label 3."
     )
 
+    if smoke:
+        print(
+            "\n[SMOKE TEST] Completed through Part 4 successfully.\n"
+            "Skipping Part 5+ (large stimulus/neural downloads).\n"
+            "Use full run command without --smoke-test when ready.\n"
+        )
+        return
+
     # Part 5
     print_part_disk("Part 5")
     stim_raw = TMP / "nsd_stimuli_raw.hdf5"
@@ -2068,6 +2146,11 @@ def main() -> None:
     all_out: Dict[int, Dict[str, Path]] = {}
     for aa in range(1, 9):
         sl = list_beta_sessions(aa)
+        if len(sl) == 0:
+            raise RuntimeError(
+                f"No betas_session files found on S3 for subj{aa:02d}. "
+                "Cannot build neural arrays."
+            )
         session_lists[aa] = sl
         n_sessions[f"subj{aa:02d}"] = len(sl)
         print(f"subj{aa:02d}: {len(sl)} beta sessions on S3")
@@ -2088,7 +2171,12 @@ def main() -> None:
             )
         except Exception as e:
             log_error(f"subj{aa:02d} session loop", e)
-        verify_neural(aa, paths, n_final, min_reps)
+        ok_subj = verify_neural(aa, paths, n_final, min_reps)
+        if not ok_subj:
+            raise RuntimeError(
+                f"subj{aa:02d}: all neural outputs are NaN after processing. "
+                "Aborting to avoid producing invalid final outputs."
+            )
 
     # Part 8
     print_part_disk("Part 8")
