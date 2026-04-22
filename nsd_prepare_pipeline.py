@@ -115,7 +115,12 @@ S3_BUCKET = "s3://natural-scenes-dataset"
 ROOT = Path(".").resolve()
 PREP = ROOT / "nsd_prepared"
 TMP = ROOT / "nsd_tmp"
+BETA_CACHE = TMP / "betas_sessions"
 ERR_LOG = PREP / "errors.log"
+OFFLINE_MODE = False
+PREFETCH_ONLY_MODE = False
+ALL_SUBJECTS = list(range(1, 9))
+RUN_SUBJECTS = list(ALL_SUBJECTS)
 
 # FreeSurfer label lookup on NSD S3 uses *.mgz.ctab (not *.mgz.txt)
 LABEL_LOOKUP_SUFFIX = ".mgz.ctab"
@@ -186,6 +191,11 @@ def _aws_child_environ() -> dict:
 
 
 def aws_run(args: List[str], **kwargs) -> subprocess.CompletedProcess:
+    if OFFLINE_MODE:
+        raise RuntimeError(
+            "AWS command requested in --offline mode. "
+            "Run once with --prefetch-only on login node first."
+        )
     kwargs.setdefault("env", _aws_child_environ())
     return subprocess.run(
         args,
@@ -200,12 +210,28 @@ def aws_s3_cp(src: str, dst: str | Path, recursive: bool = False) -> None:
     dst = Path(dst)
     if recursive:
         dst.mkdir(parents=True, exist_ok=True)
+        if dst.exists() and any(dst.iterdir()):
+            print(f"[AWS CACHE] Using existing directory: {dst}")
+            return
         check_disk_space(0.1, str(dst))
     else:
         dst.parent.mkdir(parents=True, exist_ok=True)
+        if dst.exists() and dst.stat().st_size > 0:
+            print(f"[AWS CACHE] Using existing file: {dst}")
+            return
+        if OFFLINE_MODE:
+            raise RuntimeError(
+                f"Offline mode: required cached file missing: {dst}\n"
+                f"(source would have been: {src})"
+            )
         check_disk_space(0.05, str(dst.parent))
     cmd = ["aws", "s3", "cp", src, str(dst), "--no-sign-request"]
     if recursive:
+        if OFFLINE_MODE:
+            raise RuntimeError(
+                f"Offline mode: required cached directory missing: {dst}\n"
+                f"(source would have been: {src})"
+            )
         cmd.insert(-1, "--recursive")
     aws_run(cmd)
 
@@ -238,6 +264,9 @@ def ensure_aws_cli() -> None:
 
 
 def verify_s3_access() -> None:
+    if OFFLINE_MODE:
+        print("[0.3] Offline mode: skipping S3 reachability check.")
+        return
     print("[0.3] Testing public S3 access...")
     try:
         aws_s3_ls(f"{S3_BUCKET}/")
@@ -290,6 +319,26 @@ def gate_subjects(non_interactive: bool = False) -> None:
         sys.exit(1)
 
 
+def parse_subjects_arg(raw: str) -> List[int]:
+    vals = [x.strip().lower() for x in raw.split(",") if x.strip()]
+    if not vals:
+        raise ValueError("Empty --subjects argument.")
+    out: List[int] = []
+    for tok in vals:
+        if tok == "all":
+            return list(ALL_SUBJECTS)
+        m = re.fullmatch(r"(?:subj)?0*([1-8])", tok)
+        if not m:
+            raise ValueError(
+                f"Invalid subject token '{tok}'. Use values like subj01,1,...,subj08 or 'all'."
+            )
+        aa = int(m.group(1))
+        if aa not in out:
+            out.append(aa)
+    out.sort()
+    return out
+
+
 def create_directories() -> None:
     for p in [
         PREP,
@@ -297,6 +346,8 @@ def create_directories() -> None:
         PREP / "surfaces",
         *[PREP / f"subj{aa:02d}" for aa in range(1, 9)],
         TMP,
+        BETA_CACHE,
+        *[BETA_CACHE / f"subj{aa:02d}" for aa in range(1, 9)],
         TMP / "atlases" / "labels",
         *[TMP / "atlases" / f"subj{aa:02d}" for aa in range(1, 9)],
         TMP / "surfaces" / "fsaverage" / "labels",
@@ -937,6 +988,7 @@ def extract_stimuli_224(
     n_final: int,
 ) -> None:
     out_path = PREP / "nsd_stimuli_224.hdf5"
+    part_path = PREP / "nsd_stimuli_224.partial.hdf5"
     raw_path = TMP / "nsd_stimuli_raw.hdf5"
 
     def _prepared_stim_ok(path: Path) -> bool:
@@ -972,6 +1024,35 @@ def extract_stimuli_224(
             return
         print(f"[5.4] Existing {out_path.name} appears incomplete; rebuilding it.")
         out_path.unlink()
+
+    # If a previous extraction was interrupted (e.g., login-node kill), resume from
+    # a partial file instead of restarting from image 0.
+    resume_idx = 0
+    if part_path.exists():
+        try:
+            with h5py.File(part_path, "r") as f_part:
+                if "/images" in f_part and "/global_image_indices_73k" in f_part:
+                    dpart = f_part["/images"]
+                    gipart = f_part["/global_image_indices_73k"]
+                    if (
+                        dpart.shape == (n_final, 224, 224, 3)
+                        and dpart.dtype == np.uint8
+                        and gipart.shape == (n_final,)
+                    ):
+                        resume_idx = int(dpart.attrs.get("completed_until", 0))
+                        resume_idx = max(0, min(resume_idx, n_final))
+                        print(
+                            f"[5.4] Resuming partial extraction from image index {resume_idx}/{n_final}."
+                        )
+                    else:
+                        print(f"[5.4] Discarding incompatible partial file {part_path.name}.")
+                        part_path.unlink()
+                else:
+                    print(f"[5.4] Discarding incomplete partial file {part_path.name}.")
+                    part_path.unlink()
+        except OSError:
+            print(f"[5.4] Partial file {part_path.name} unreadable; rebuilding.")
+            part_path.unlink()
     with h5py.File(raw_path, "r") as f_in:
         brick = f_in["/imgBrick"]
         shape = tuple(brick.shape)
@@ -982,7 +1063,9 @@ def extract_stimuli_224(
 
         def _read_img(g73k: int) -> np.ndarray:
             """Return one RGB image as (H, W, 3), regardless of axis order."""
-            raw3 = np.take(brick, g73k, axis=img_axis)  # 3D
+            idx = [slice(None)] * len(shape)
+            idx[img_axis] = int(g73k)
+            raw3 = brick[tuple(idx)]  # 3D
             arr = np.asarray(raw3)
             if arr.ndim != 3:
                 raise RuntimeError(
@@ -1000,35 +1083,55 @@ def extract_stimuli_224(
                 f"raw shape={arr.shape}, brick_shape={shape}"
             )
 
-        with h5py.File(out_path, "w") as f_out:
-            d = f_out.create_dataset(
-                "/images",
-                shape=(n_final, 224, 224, 3),
-                dtype=np.uint8,
-                chunks=(1, 224, 224, 3),
-                compression="gzip",
-                compression_opts=4,
-            )
-            d.attrs["source"] = "NSD nsd_stimuli.hdf5 /imgBrick"
-            d.attrs["resize"] = "224x224"
-            d.attrs["color_space"] = "RGB"
-            d.attrs["index_base"] = "0-based 73k IDs"
-            d.attrs["min_reps"] = min_reps
-            d.attrs["n_subjects"] = 8
-            d.attrs["n_images"] = n_final
-            gi = f_out.create_dataset(
-                "/global_image_indices_73k",
-                data=np.array(final_list, dtype=np.int32),
-            )
-            gi.attrs["index_base"] = "0-based"
-            for batch_start in range(0, n_final, 500):
-                batch = final_list[batch_start : batch_start + 500]
-                for pos, g73k in enumerate(batch):
-                    img = _read_img(int(g73k))
-                    im = Image.fromarray(img)
-                    im = im.resize((224, 224), Image.LANCZOS)
-                    d[batch_start + pos] = np.asarray(im, dtype=np.uint8)
-                print(f"Processed {batch_start + len(batch)}/{n_final} images")
+        # Default to uncompressed writes to avoid high CPU load on login nodes.
+        compression_name = os.environ.get("NSD_STIM_COMPRESSION", "").strip().lower()
+        if compression_name == "gzip":
+            compression: Optional[str] = "gzip"
+            compression_opts: Optional[int] = 4
+            print("[5.4] Writing stimuli with gzip compression.")
+        else:
+            compression = None
+            compression_opts = None
+            print("[5.4] Writing stimuli without compression (login-node friendly).")
+
+        open_mode = "r+" if part_path.exists() and resume_idx > 0 else "w"
+        with h5py.File(part_path, open_mode) as f_out:
+            if open_mode == "w":
+                d = f_out.create_dataset(
+                    "/images",
+                    shape=(n_final, 224, 224, 3),
+                    dtype=np.uint8,
+                    chunks=(1, 224, 224, 3),
+                    compression=compression,
+                    compression_opts=compression_opts,
+                )
+                d.attrs["source"] = "NSD nsd_stimuli.hdf5 /imgBrick"
+                d.attrs["resize"] = "224x224"
+                d.attrs["color_space"] = "RGB"
+                d.attrs["index_base"] = "0-based 73k IDs"
+                d.attrs["min_reps"] = min_reps
+                d.attrs["n_subjects"] = 8
+                d.attrs["n_images"] = n_final
+                d.attrs["completed_until"] = 0
+                gi = f_out.create_dataset(
+                    "/global_image_indices_73k",
+                    data=np.array(final_list, dtype=np.int32),
+                )
+                gi.attrs["index_base"] = "0-based"
+            else:
+                d = f_out["/images"]
+
+            for i in range(resume_idx, n_final):
+                g73k = int(final_list[i])
+                img = _read_img(g73k)
+                im = Image.fromarray(img)
+                im = im.resize((224, 224), Image.LANCZOS)
+                d[i] = np.asarray(im, dtype=np.uint8)
+                if (i + 1) % 10 == 0 or (i + 1) == n_final:
+                    d.attrs["completed_until"] = i + 1
+                    f_out.flush()
+                    print(f"Processed {i + 1}/{n_final} images")
+        part_path.replace(out_path)
     # verify
     with h5py.File(out_path, "r") as f:
         assert f["/images"].shape == (n_final, 224, 224, 3)
@@ -1048,7 +1151,7 @@ def extract_stimuli_224(
 # =============================================================================
 def download_atlases_all_subjects(roi_cfg: Dict[str, Any]) -> None:
     atlases = {roi_cfg[r]["atlas"] for r in ROI_ORDER}
-    for aa in range(1, 9):
+    for aa in RUN_SUBJECTS:
         sub = f"subj{aa:02d}"
         base = f"{S3_BUCKET}/nsddata/ppdata/{sub}/func1pt8mm/roi/"
         outd = TMP / "atlases" / sub
@@ -1066,7 +1169,7 @@ def build_masks(
     mask_flat: Dict[int, Dict[str, np.ndarray]] = defaultdict(dict)
     voxel_count: Dict[int, Dict[str, int]] = defaultdict(dict)
     v3_mask: Dict[int, np.ndarray] = {}
-    for aa in range(1, 9):
+    for aa in RUN_SUBJECTS:
         sub = f"subj{aa:02d}"
         for roi in ROI_ORDER:
             atlas = roi_cfg[roi]["atlas"]
@@ -1092,7 +1195,7 @@ def print_voxel_table(voxel_count: Dict[int, Dict[str, int]]) -> None:
         "├─────────┼───────────┼───────────┼───────────┼───────────┤"
     )
     means = {r: [] for r in ROI_ORDER}
-    for aa in range(1, 9):
+    for aa in RUN_SUBJECTS:
         row = [f"subj{aa:02d}"]
         for roi in ROI_ORDER:
             v = voxel_count[aa][roi]
@@ -1114,6 +1217,15 @@ def print_voxel_table(voxel_count: Dict[int, Dict[str, int]]) -> None:
 # =============================================================================
 def list_beta_sessions(aa: int) -> List[int]:
     sub = f"subj{aa:02d}"
+    if OFFLINE_MODE:
+        cache_dir = BETA_CACHE / sub
+        sessions: List[int] = []
+        for p in sorted(cache_dir.glob("betas_session*.hdf5")):
+            m = re.search(r"betas_session(\d+)\.hdf5", p.name)
+            if m:
+                sessions.append(int(m.group(1)))
+        sessions.sort()
+        return sessions
     uri = f"{S3_BUCKET}/nsddata_betas/ppdata/{sub}/func1pt8mm/betas_fithrf/"
     out = aws_s3_ls(uri)
     sessions: List[int] = []
@@ -1218,41 +1330,100 @@ def process_subject_sessions(
             f"{S3_BUCKET}/nsddata_betas/ppdata/subj{aa:02d}/"
             f"func1pt8mm/betas_fithrf/betas_session{BB:02d}.hdf5"
         )
+        cache_file = BETA_CACHE / f"subj{aa:02d}" / f"betas_session{BB:02d}.hdf5"
         tmp = TMP / "betas_tmp.hdf5"
+        session_file = cache_file if cache_file.exists() else tmp
         try:
-            aws_s3_cp(src, tmp)
+            if not cache_file.exists():
+                if tmp.exists():
+                    tmp.unlink()
+                aws_s3_cp(src, tmp)
         except Exception as e:
             log_error(f"subj{aa:02d} session {BB} download", e)
             failed.append(BB)
             return
-        with h5py.File(tmp, "r") as f:
-            betas_int16 = f["/betas"][:]
-        betas = betas_int16.astype(np.float32) / 300.0
-        del betas_int16
-        gt0 = (BB - 1) * 750
-        sess_idx = trial_local_idx[aa][gt0 : gt0 + 750]
-        fds = {
-            roi: h5py.File(out_paths[roi], "r+") for roi in ROI_ORDER
-        }
-        try:
+
+        def _align_mask(mask_xyz: np.ndarray, target_shape: Tuple[int, int, int]) -> np.ndarray:
+            if mask_xyz.shape == target_shape:
+                return mask_xyz
+            # Common NSD mismatch: atlas loaded as (X,Y,Z) while beta volume uses (Z,Y,X).
+            if mask_xyz.transpose(2, 1, 0).shape == target_shape:
+                return mask_xyz.transpose(2, 1, 0)
+            for p in ((0, 1, 2), (0, 2, 1), (1, 0, 2), (1, 2, 0), (2, 0, 1), (2, 1, 0)):
+                cand = np.transpose(mask_xyz, p)
+                if cand.shape == target_shape:
+                    return cand
+            raise RuntimeError(
+                f"Cannot align ROI mask shape {mask_xyz.shape} to beta spatial shape {target_shape}."
+            )
+
+        with h5py.File(session_file, "r") as f_beta:
+            dset = f_beta["/betas"]
+            shp = tuple(int(x) for x in dset.shape)
+            trial_axes = [i for i, s in enumerate(shp) if s == 750]
+            if len(trial_axes) != 1:
+                raise RuntimeError(
+                    f"Expected exactly one trial axis of length 750, got shape={shp}."
+                )
+            t_ax = trial_axes[0]
+            spatial_axes = [i for i in range(4) if i != t_ax]
+            spatial_shape = tuple(shp[i] for i in spatial_axes)
+            gt0 = (BB - 1) * 750
+            sess_idx = trial_local_idx[aa][gt0 : gt0 + 750]
+            if len(sess_idx) != 750:
+                raise RuntimeError(
+                    f"subj{aa:02d} session {BB:02d}: expected 750 trials, got {len(sess_idx)}."
+                )
+
+            roi_lin_idx: Dict[str, np.ndarray] = {}
+            for roi in ROI_ORDER:
+                mm = _align_mask(mask_3d[aa][roi], spatial_shape)
+                roi_lin_idx[roi] = np.flatnonzero(mm.ravel(order="C"))
+
+            final_pos_by_trial: List[Optional[int]] = []
             for t in range(750):
                 local_10k = sess_idx[t]
                 g73k = int(subject_73k_ids[aa][local_10k])
-                if g73k not in final_set_pos:
-                    continue
-                fp = final_set_pos[g73k]
-                rs = int(repeat_counter[fp])
-                if rs >= min_reps:
-                    continue
-                for roi in ROI_ORDER:
-                    m = mask_3d[aa][roi]
-                    vec = betas[m, t]
-                    fds[roi]["/betas"][fp, rs, :] = vec
-                repeat_counter[fp] += 1
-        finally:
-            for f in fds.values():
-                f.close()
-        if tmp.exists():
+                final_pos_by_trial.append(final_set_pos.get(g73k))
+
+            def _read_trial_float32(trial_idx: int) -> np.ndarray:
+                sel: List[Any] = [slice(None)] * 4
+                sel[t_ax] = trial_idx
+                vol = np.asarray(dset[tuple(sel)], dtype=np.float32) / 300.0
+                if tuple(vol.shape) != spatial_shape:
+                    raise RuntimeError(
+                        f"Unexpected beta trial shape {vol.shape}; expected {spatial_shape}."
+                    )
+                return vol
+
+            fds = {
+                roi: h5py.File(out_paths[roi], "r+") for roi in ROI_ORDER
+            }
+            try:
+                n_write = 0
+                for t in range(750):
+                    fp = final_pos_by_trial[t]
+                    if fp is None:
+                        continue
+                    rs = int(repeat_counter[fp])
+                    if rs >= min_reps:
+                        continue
+                    flat = _read_trial_float32(t).ravel(order="C")
+                    for roi in ROI_ORDER:
+                        vec = flat[roi_lin_idx[roi]]
+                        fds[roi]["/betas"][fp, rs, :] = vec.astype(np.float32, copy=False)
+                    repeat_counter[fp] += 1
+                    n_write += 1
+                    if n_write % 50 == 0:
+                        n_done_mid = int(np.sum(repeat_counter >= min_reps))
+                        print(
+                            f"[subj{aa:02d}] Session {BB:02d}: wrote {n_write} target trials | "
+                            f"images complete {n_done_mid}/{n_final}"
+                        )
+            finally:
+                for f in fds.values():
+                    f.close()
+        if session_file == tmp and tmp.exists():
             os.remove(tmp)
         n_done = int(np.sum(repeat_counter >= min_reps))
         free = shutil.disk_usage(".").free / 1e9
@@ -1272,6 +1443,24 @@ def process_subject_sessions(
             run_session(BB)
         except Exception as e:
             log_error(f"subj{aa:02d} session {BB} retry", e)
+
+
+def prefetch_all_beta_sessions() -> None:
+    print("[PREFETCH] Downloading all betas_session files to local cache...")
+    total = 0
+    for aa in RUN_SUBJECTS:
+        sub = f"subj{aa:02d}"
+        sessions = list_beta_sessions(aa)
+        print(f"[PREFETCH] {sub}: {len(sessions)} sessions")
+        for BB in sessions:
+            dst = BETA_CACHE / sub / f"betas_session{BB:02d}.hdf5"
+            src = (
+                f"{S3_BUCKET}/nsddata_betas/ppdata/{sub}/"
+                f"func1pt8mm/betas_fithrf/betas_session{BB:02d}.hdf5"
+            )
+            aws_s3_cp(src, dst)
+            total += 1
+    print(f"[PREFETCH] Cached {total} betas_session files.")
 
 
 def verify_neural(
@@ -1405,10 +1594,13 @@ def qc_inter_repeat(
 def qc_final_rep_distribution(
     min_reps: int, n_final: int, all_out: Dict[int, Dict[str, Path]]
 ) -> None:
-    fig, axes = plt.subplots(4, 8, figsize=(22, 14))
+    n_subj = len(RUN_SUBJECTS)
+    fig, axes = plt.subplots(4, n_subj, figsize=(max(8, 2.8 * n_subj), 14))
+    if n_subj == 1:
+        axes = np.expand_dims(axes, axis=1)
     for ri, roi in enumerate(ROI_ORDER):
-        for sj in range(1, 9):
-            ax = axes[ri, sj - 1]
+        for sj_idx, sj in enumerate(RUN_SUBJECTS):
+            ax = axes[ri, sj_idx]
             p = all_out[sj][roi]
             with h5py.File(p, "r") as f:
                 b = f["/betas"][:]
@@ -1426,7 +1618,7 @@ def qc_final_rep_distribution(
             ax.set_title(f"{roi} subj{sj:02d}\ncomplete={frac:.2f}", fontsize=7)
             if ri == 3:
                 ax.set_xlabel("repeats filled")
-            if sj == 1:
+            if sj_idx == 0:
                 ax.set_ylabel("n images")
     plt.suptitle("Final repetition distribution (actual HDF5 fills)")
     plt.tight_layout()
@@ -1601,7 +1793,7 @@ def compute_nc_stats(
     min_reps: int,
 ) -> Dict[int, Dict[str, Dict[str, Any]]]:
     stats_out: Dict[int, Dict[str, Dict[str, Any]]] = defaultdict(dict)
-    for aa in range(1, 9):
+    for aa in RUN_SUBJECTS:
         path = TMP / "ncsnr" / f"subj{aa:02d}_ncsnr.nii.gz"
         vol = nib.load(str(path)).get_fdata().astype(np.float32)
         for roi in ROI_ORDER:
@@ -1628,7 +1820,7 @@ def print_nc_table(stats_out: Dict[int, Dict[str, Dict[str, Any]]]) -> None:
         "╠══════════╬═══════╬══════════╬══════════╬══════════╬══════════╬══════════╣"
     )
     group: Dict[str, List[float]] = {r: [] for r in ROI_ORDER}
-    for aa in range(1, 9):
+    for aa in RUN_SUBJECTS:
         for roi in ROI_ORDER:
             s = stats_out[aa][roi]
             group[roi].append(s["mean"])
@@ -1642,9 +1834,9 @@ def print_nc_table(stats_out: Dict[int, Dict[str, Dict[str, Any]]]) -> None:
     )
     for roi in ROI_ORDER:
         gm = float(np.mean(group[roi]))
-        gmed = float(np.median([stats_out[aa][roi]["median"] for aa in range(1, 9)]))
-        gp25 = float(np.mean([stats_out[aa][roi]["p25"] for aa in range(1, 9)]))
-        gp75 = float(np.mean([stats_out[aa][roi]["p75"] for aa in range(1, 9)]))
+        gmed = float(np.median([stats_out[aa][roi]["median"] for aa in RUN_SUBJECTS]))
+        gp25 = float(np.mean([stats_out[aa][roi]["p25"] for aa in RUN_SUBJECTS]))
+        gp75 = float(np.mean([stats_out[aa][roi]["p75"] for aa in RUN_SUBJECTS]))
         print(
             f"║ GROUP    ║  {roi:3s}  ║    ---   ║ {gm:8.1f} ║ {gmed:8.1f} ║ "
             f"{gp25:8.1f} ║ {gp75:8.1f} ║"
@@ -1655,7 +1847,7 @@ def print_nc_table(stats_out: Dict[int, Dict[str, Dict[str, Any]]]) -> None:
     print(
         "Expected (reference): V1 ≈ 50–70%, V2 ≈ 45–65%, V4 ≈ 30–50%, IT ≈ 20–45%."
     )
-    for aa in range(1, 9):
+    for aa in RUN_SUBJECTS:
         for roi in ROI_ORDER:
             m = stats_out[aa][roi]["mean"]
             if m < 10:
@@ -1670,11 +1862,14 @@ def print_nc_table(stats_out: Dict[int, Dict[str, Dict[str, Any]]]) -> None:
 def plot_nc_distributions(
     stats_out: Dict[int, Dict[str, Dict[str, Any]]], min_reps: int
 ) -> None:
-    fig, axes = plt.subplots(4, 8, figsize=(28, 16))
+    n_subj = len(RUN_SUBJECTS)
+    fig, axes = plt.subplots(4, n_subj, figsize=(max(10, 3.2 * n_subj), 16))
+    if n_subj == 1:
+        axes = np.expand_dims(axes, axis=1)
     for ri, roi in enumerate(ROI_ORDER):
         col = ROI_COLORS_QC[roi]
-        for sj in range(1, 9):
-            ax = axes[ri, sj - 1]
+        for sj_idx, sj in enumerate(RUN_SUBJECTS):
+            ax = axes[ri, sj_idx]
             s = stats_out[sj][roi]
             arr = s["nc_pct_arr"]
             ax.hist(arr, bins=30, range=(0, 100), color=col, alpha=0.7)
@@ -1686,7 +1881,7 @@ def plot_nc_distributions(
             )
             if ri == 3:
                 ax.set_xlabel("Noise Ceiling (%)")
-            if sj == 1:
+            if sj_idx == 0:
                 ax.set_ylabel("Voxel count")
     plt.suptitle(
         f"Noise Ceiling Distributions by ROI and Subject\n"
@@ -1790,7 +1985,7 @@ def plot_nc_hierarchy(
 ) -> None:
     fig, ax = plt.subplots(figsize=(8, 6))
     xs = [1, 2, 3, 4]
-    for aa in range(1, 9):
+    for aa in RUN_SUBJECTS:
         means = [stats_out[aa][r]["mean"] for r in ROI_ORDER]
         ax.plot(
             xs,
@@ -1802,12 +1997,13 @@ def plot_nc_hierarchy(
             label=f"subj{aa:02d}",
         )
     group_means = [
-        float(np.mean([stats_out[aa][r]["mean"] for aa in range(1, 9)]))
+        float(np.mean([stats_out[aa][r]["mean"] for aa in RUN_SUBJECTS]))
         for r in ROI_ORDER
     ]
     group_sems = [
         float(
-            np.std([stats_out[aa][r]["mean"] for aa in range(1, 9)]) / np.sqrt(8)
+            np.std([stats_out[aa][r]["mean"] for aa in RUN_SUBJECTS])
+            / np.sqrt(max(1, len(RUN_SUBJECTS)))
         )
         for r in ROI_ORDER
     ]
@@ -1839,7 +2035,7 @@ def plot_nc_hierarchy(
     fig.savefig(out, dpi=120)
     plt.close(fig)
     print(f"Saved {out}")
-    for aa in range(1, 9):
+    for aa in RUN_SUBJECTS:
         ms = [stats_out[aa][r]["mean"] for r in ROI_ORDER]
         if not all(ms[i] >= ms[i + 1] for i in range(3)):
             print(
@@ -1849,7 +2045,7 @@ def plot_nc_hierarchy(
 
 def save_nc_npz(stats_out: Dict[int, Dict[str, Dict[str, Any]]]) -> None:
     kw: Dict[str, Any] = {}
-    for aa in range(1, 9):
+    for aa in RUN_SUBJECTS:
         for roi in ROI_ORDER:
             kw[f"subj{aa:02d}_{roi}_ncsnr"] = stats_out[aa][roi]["nc_pct_arr"]
             kw[f"subj{aa:02d}_{roi}_mean"] = np.float32(stats_out[aa][roi]["mean"])
@@ -1872,7 +2068,7 @@ def validate_outputs(
             if f["/images"].shape[0] != n_final:
                 print("WARNING: stimuli shape mismatch")
                 ok = False
-    for aa in range(1, 9):
+    for aa in RUN_SUBJECTS:
         for roi in ROI_ORDER:
             p = PREP / f"subj{aa:02d}" / f"nsd_neural_{roi}.hdf5"
             nv = voxel_count[aa][roi]
@@ -1902,14 +2098,14 @@ def write_metadata(
     it_proxy_note: str,
 ) -> None:
     gm = {
-        r: float(np.mean([stats_out[aa][r]["mean"] for aa in range(1, 9)]))
+        r: float(np.mean([stats_out[aa][r]["mean"] for aa in RUN_SUBJECTS]))
         for r in ROI_ORDER
     }
     meta = {
         "nsd_manual_url": NSD_MANUAL_URL,
         "creation_date": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
         "pipeline_version": "1.0",
-        "subjects": [f"subj{aa:02d}" for aa in range(1, 9)],
+        "subjects": [f"subj{aa:02d}" for aa in RUN_SUBJECTS],
         "n_sessions_per_subject": n_sessions,
         "image_set": {
             "n_final_images": n_final,
@@ -1929,7 +2125,7 @@ def write_metadata(
         },
         "per_subject_voxel_counts": {
             f"subj{aa:02d}": {r: voxel_count[aa][r] for r in ROI_ORDER}
-            for aa in range(1, 9)
+            for aa in RUN_SUBJECTS
         },
         "noise_ceiling": {
             "formula": "NC(%) = ncsnr^2 / (ncsnr^2 + 1/n) * 100",
@@ -1973,7 +2169,7 @@ def print_final_summary(
         "│ Subject │ N images │ Min reps │ V1 voxels │ V2 voxels │ V4 voxels │ IT voxels │\n"
         "├─────────┼──────────┼──────────┼───────────┼───────────┼───────────┼───────────┤"
     )
-    for aa in range(1, 9):
+    for aa in RUN_SUBJECTS:
         print(
             f"│ subj{aa:02d}  │ {n_final:8d} │ {min_reps:8d} │ "
             f"{voxel_count[aa]['V1']:9d} │ {voxel_count[aa]['V2']:9d} │ "
@@ -2011,16 +2207,45 @@ def parse_args() -> argparse.Namespace:
         help="Run only lightweight stages and stop before large downloads "
         "(exits after Part 4, before Part 5 stimulus download).",
     )
+    p.add_argument(
+        "--offline",
+        action="store_true",
+        help="Disable ALL AWS calls. Requires files to be prefetched locally first.",
+    )
+    p.add_argument(
+        "--prefetch-only",
+        action="store_true",
+        help="Download/cache all AWS assets and exit without heavy processing.",
+    )
+    p.add_argument(
+        "--subjects",
+        type=str,
+        default="all",
+        help="Comma-separated subjects to process (e.g., 'subj01' or 'subj01,subj03'). Use 'all' for subj01-subj08.",
+    )
     return p.parse_args()
 
 
 def main() -> None:
+    global OFFLINE_MODE, PREFETCH_ONLY_MODE, RUN_SUBJECTS
     args = parse_args()
     ni = bool(args.non_interactive)
     smoke = bool(args.smoke_test)
+    OFFLINE_MODE = bool(args.offline)
+    PREFETCH_ONLY_MODE = bool(args.prefetch_only)
+    RUN_SUBJECTS = parse_subjects_arg(str(args.subjects))
+    if OFFLINE_MODE and PREFETCH_ONLY_MODE:
+        raise RuntimeError("Use either --offline or --prefetch-only, not both.")
+    print(
+        f"[0.0] Selected subjects for processing: "
+        f"{', '.join(f'subj{aa:02d}' for aa in RUN_SUBJECTS)}"
+    )
     setup_logging()
     print_part_disk("Part 0")
-    ensure_aws_cli()
+    if not OFFLINE_MODE:
+        ensure_aws_cli()
+    else:
+        print("[0.2] Offline mode: skipping AWS CLI checks.")
     verify_s3_access()
     gate_data_agreement(non_interactive=ni)
     gate_subjects(non_interactive=ni)
@@ -2105,6 +2330,42 @@ def main() -> None:
         "else Kastner2015 VO/PHC; else fallback label 3."
     )
 
+    if PREFETCH_ONLY_MODE:
+        print_part_disk("PREFETCH")
+        stim_raw = TMP / "nsd_stimuli_raw.hdf5"
+        if not _recover_complete_stimulus_file(stim_raw):
+            download_stimuli_progress(
+                f"{S3_BUCKET}/nsddata_stimuli/stimuli/nsd/nsd_stimuli.hdf5",
+                stim_raw,
+            )
+        else:
+            print(f"[PREFETCH] Found existing complete stimulus file: {stim_raw}")
+        download_atlases_all_subjects(roi_cfg)
+        prefetch_all_beta_sessions()
+        try:
+            download_surface_assets(it_atlas)
+        except Exception as e:
+            log_error("prefetch download_surface_assets", e)
+        for aa in RUN_SUBJECTS:
+            aws_s3_cp(
+                f"{S3_BUCKET}/nsddata_betas/ppdata/subj{aa:02d}/func1pt8mm/betas_fithrf/ncsnr.nii.gz",
+                TMP / "ncsnr" / f"subj{aa:02d}_ncsnr.nii.gz",
+            )
+        aws_s3_cp(
+            f"{S3_BUCKET}/nsddata_betas/ppdata/subj01/fsaverage/betas_fithrf/lh.ncsnr.mgh",
+            TMP / "ncsnr" / "lh.ncsnr.mgh",
+        )
+        aws_s3_cp(
+            f"{S3_BUCKET}/nsddata_betas/ppdata/subj01/fsaverage/betas_fithrf/rh.ncsnr.mgh",
+            TMP / "ncsnr" / "rh.ncsnr.mgh",
+        )
+        print(
+            "\n[PREFETCH] Completed cache download phase.\n"
+            "Now run on compute node with: --offline -y\n"
+            "No AWS calls will be attempted in offline mode.\n"
+        )
+        return
+
     if smoke:
         print(
             "\n[SMOKE TEST] Completed through Part 4 successfully.\n"
@@ -2144,7 +2405,7 @@ def main() -> None:
     n_sessions: Dict[str, int] = {}
     session_lists: Dict[int, List[int]] = {}
     all_out: Dict[int, Dict[str, Path]] = {}
-    for aa in range(1, 9):
+    for aa in RUN_SUBJECTS:
         sl = list_beta_sessions(aa)
         if len(sl) == 0:
             raise RuntimeError(
@@ -2197,7 +2458,7 @@ def main() -> None:
         roi_comparison_figure()
     except Exception as e:
         log_error("surface plots", e)
-    for aa in range(1, 9):
+    for aa in RUN_SUBJECTS:
         aws_s3_cp(
             f"{S3_BUCKET}/nsddata_betas/ppdata/subj{aa:02d}/func1pt8mm/betas_fithrf/ncsnr.nii.gz",
             TMP / "ncsnr" / f"subj{aa:02d}_ncsnr.nii.gz",
@@ -2239,7 +2500,7 @@ def main() -> None:
 ║  NSD DATASET PREPARATION COMPLETE                             ║
 ║                                                               ║
 ║  Images:   {n_final} × 224×224×3 (uint8)                       ║
-║  Subjects: 8  |  ROIs: V1, V2, V4, IT  |  Min reps: {min_reps} ║
+║  Subjects: {len(RUN_SUBJECTS)}  |  ROIs: V1, V2, V4, IT  |  Min reps: {min_reps} ║
 ║  All outputs in: ./nsd_prepared/                              ║
 ║  See metadata.json for full provenance.                       ║
 ╚════════════════════════════════════════════════════════════════╝

@@ -24,3 +24,11 @@ env/
 
 # Logs / local AWS debug
 *.log
+logs/
+
+# SLURM outputs
+slurm-*.out
+slurm-*.err
+
+# Matplotlib local cache/config
+.mplconfig/
