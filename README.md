@@ -58,6 +58,49 @@ Temporary downloads use **`./nsd_tmp/`** and are removed after **successful** en
 
 ---
 
+## How to Run
+
+### Interactive (recommended)
+
+```bash
+conda activate fmri
+python nsd_prepare_pipeline.py
+```
+
+What happens:
+- You confirm NSD agreement.
+- You are prompted to select **one subject** (`subj01`..`subj08`) for this run.
+- You can confirm/modify ROI mapping (or accept defaults).
+- The pipeline filters images **per selected subject** (keeps images with reps `>= 3` by default).
+
+### Non-interactive (for automation)
+
+Required/important flags:
+- `--non-interactive` / `-y`: skip prompts and use defaults.
+- `--subjects subj0X`: choose the single subject to process.
+- `--smoke-test`: run Parts 0–4 only (no large downloads).
+
+Examples:
+
+```bash
+# Full run for one subject (default MIN_REPS=3, default ROIs)
+python nsd_prepare_pipeline.py -y --subjects subj01
+
+# Quick validation run (no large downloads)
+python nsd_prepare_pipeline.py -y --subjects subj01 --smoke-test
+```
+
+### Expected inputs
+
+- Internet access to NSD public S3 bucket.
+- NSD agreement completed.
+- Existing local files are reused when valid:
+  - design files under `nsd_tmp/`
+  - raw stimulus cache if already fully downloaded
+  - previously created prepared outputs if shape/content checks pass
+
+---
+
 ## Quick start (conda)
 
 ```bash

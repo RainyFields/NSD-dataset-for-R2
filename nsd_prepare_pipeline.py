@@ -302,21 +302,30 @@ def gate_data_agreement(non_interactive: bool = False) -> None:
         sys.exit(1)
 
 
-def gate_subjects(non_interactive: bool = False) -> None:
+def gate_subjects(non_interactive: bool = False, subjects_arg: str = "subj01") -> List[int]:
     if non_interactive:
+        subs = parse_subjects_arg(subjects_arg)
         print(
-            "[non-interactive] Processing all 8 subjects (subj01–subj08) without prompt."
+            "[non-interactive] Subject selection from --subjects: "
+            + ", ".join(f"subj{aa:02d}" for aa in subs)
         )
-        return
+        return subs
     print(
-        'This pipeline will process all 8 NSD subjects (subj01–subj08) '
-        "for cross-subject overlap analysis. Subjects with incomplete "
-        "sessions will be flagged but not skipped.\nConfirm? (YES / NO)"
+        "Select ONE subject to process in this run.\n"
+        "Enter one of: subj01, subj02, ..., subj08 (or 1..8)."
     )
-    ans = input("Your response: ").strip().upper()
-    if ans != "YES":
-        print("Aborting.")
-        sys.exit(1)
+    while True:
+        raw = input("Subject: ").strip()
+        try:
+            subs = parse_subjects_arg(raw)
+        except ValueError as e:
+            print(str(e))
+            continue
+        if len(subs) != 1:
+            print("Please select exactly one subject for this run.")
+            continue
+        print(f"Selected subject: subj{subs[0]:02d}")
+        return subs
 
 
 def parse_subjects_arg(raw: str) -> List[int]:
@@ -621,24 +630,25 @@ def finalize_image_set(
     subject_73k_ids: Dict[int, np.ndarray],
     global_to_local: Dict[int, Dict[int, int]],
     min_reps: int,
+    run_subjects: List[int],
 ) -> Tuple[List[int], Dict[int, List[int]], Dict[int, int]]:
-    # Images in ALL 8 subjects' 10k with rep >= min_reps
-    cand: Optional[set] = None
-    for aa in range(1, 9):
-        loc = np.where(rep_count[aa] >= min_reps)[0]
-        s73 = set(int(subject_73k_ids[aa][j]) for j in loc)
-        cand = s73 if cand is None else cand & s73
-    assert cand is not None
-    final_list = sorted(cand)
+    # Per-subject filtering (no cross-subject shared constraint):
+    # keep images for the selected subject that have repetitions >= min_reps.
+    if len(run_subjects) != 1:
+        raise RuntimeError(
+            "Per-subject filtering requires exactly one selected subject per run."
+        )
+    aa = int(run_subjects[0])
+    loc = np.where(rep_count[aa] >= min_reps)[0]
+    final_list = sorted(int(subject_73k_ids[aa][j]) for j in loc)
     final_set_pos = {g: p for p, g in enumerate(final_list)}
     final_local_idx: Dict[int, List[int]] = {}
-    for aa in range(1, 9):
-        g2l = global_to_local[aa]
-        final_local_idx[aa] = [g2l[g] for g in final_list]
+    g2l = global_to_local[aa]
+    final_local_idx[aa] = [g2l[g] for g in final_list]
     n_final = len(final_list)
     print(
-        f"Final image set: {n_final} images (0-based 73k IDs) shared across all 8 "
-        f"subjects with >= {min_reps} repetitions."
+        f"Final image set for subj{aa:02d}: {n_final} images (0-based 73k IDs) "
+        f"with >= {min_reps} repetitions."
     )
     np.savez(
         PREP / "final_image_set.npz",
@@ -648,7 +658,7 @@ def finalize_image_set(
             f"final_local_idx_subj{aa:02d}": np.array(
                 final_local_idx[aa], dtype=np.int64
             )
-            for aa in range(1, 9)
+            for aa in run_subjects
         },
     )
     return final_list, final_local_idx, final_set_pos
@@ -2220,8 +2230,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--subjects",
         type=str,
-        default="all",
-        help="Comma-separated subjects to process (e.g., 'subj01' or 'subj01,subj03'). Use 'all' for subj01-subj08.",
+        default="subj01",
+        help="Subject(s) to process for non-interactive mode (e.g., 'subj01'). "
+        "Interactive mode prompts for one subject at runtime.",
     )
     return p.parse_args()
 
@@ -2233,13 +2244,8 @@ def main() -> None:
     smoke = bool(args.smoke_test)
     OFFLINE_MODE = bool(args.offline)
     PREFETCH_ONLY_MODE = bool(args.prefetch_only)
-    RUN_SUBJECTS = parse_subjects_arg(str(args.subjects))
     if OFFLINE_MODE and PREFETCH_ONLY_MODE:
         raise RuntimeError("Use either --offline or --prefetch-only, not both.")
-    print(
-        f"[0.0] Selected subjects for processing: "
-        f"{', '.join(f'subj{aa:02d}' for aa in RUN_SUBJECTS)}"
-    )
     setup_logging()
     print_part_disk("Part 0")
     if not OFFLINE_MODE:
@@ -2248,7 +2254,16 @@ def main() -> None:
         print("[0.2] Offline mode: skipping AWS CLI checks.")
     verify_s3_access()
     gate_data_agreement(non_interactive=ni)
-    gate_subjects(non_interactive=ni)
+    RUN_SUBJECTS = gate_subjects(non_interactive=ni, subjects_arg=str(args.subjects))
+    if not PREFETCH_ONLY_MODE and len(RUN_SUBJECTS) != 1:
+        raise RuntimeError(
+            "This pipeline run mode processes exactly one subject at a time. "
+            "Select one subject (e.g., --subjects subj01) or use interactive prompt."
+        )
+    print(
+        f"[0.0] Selected subjects for processing: "
+        f"{', '.join(f'subj{aa:02d}' for aa in RUN_SUBJECTS)}"
+    )
     create_directories()
     print_part_disk("Part 1")
 
@@ -2293,7 +2308,7 @@ def main() -> None:
 
     min_reps = gate_min_reps(n_overlap, print_table_again, non_interactive=ni)
     final_list, final_local_idx, final_set_pos = finalize_image_set(
-        rep_count, subject_73k_ids, global_to_local, min_reps
+        rep_count, subject_73k_ids, global_to_local, min_reps, RUN_SUBJECTS
     )
     n_final = len(final_list)
 
