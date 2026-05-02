@@ -6,14 +6,17 @@ Reference: https://cvnlab.slite.com/api/s/channel/CPyFRAyDYpxdkPK6YbB5R1/NSD%20D
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import logging
 import os
+import queue
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import traceback
 from collections import defaultdict
@@ -492,6 +495,23 @@ def print_overlap_table(
         )
     print(
         "└──────────────┴────────┴────────┴────────┴────────┴────────┴────────┴────────┴────────┴────────────────────┘"
+    )
+
+
+def print_image_counts_per_subject(rep_count: Dict[int, np.ndarray]) -> None:
+    """Clean per-subject image count table for each repetition threshold."""
+    print("\nImages per subject by repetition threshold:")
+    print(
+        "┌──────────────┬────────┬────────┬────────┬────────┬────────┬────────┬────────┬────────┐\n"
+        "│  Min repeats │ Subj01 │ Subj02 │ Subj03 │ Subj04 │ Subj05 │ Subj06 │ Subj07 │ Subj08 │\n"
+        "├──────────────┼────────┼────────┼────────┼────────┼────────┼────────┼────────┼────────┤"
+    )
+    for T in (1, 2, 3):
+        counts = [int(np.sum(rep_count[aa] >= T)) for aa in range(1, 9)]
+        row = " │ ".join(f"{c:6d}" for c in counts)
+        print(f"│     >= {T}      │ {row} │")
+    print(
+        "└──────────────┴────────┴────────┴────────┴────────┴────────┴────────┴────────┘\n"
     )
 
 
@@ -992,168 +1012,212 @@ def download_stimuli_progress(src: str, dst: Path) -> None:
     print(f"Download complete. Size: {sz_gb:.2f} GB")
 
 
-def extract_stimuli_224(
-    final_list: List[int],
-    min_reps: int,
-    n_final: int,
-) -> None:
-    out_path = PREP / "nsd_stimuli_224.hdf5"
-    part_path = PREP / "nsd_stimuli_224.partial.hdf5"
-    raw_path = TMP / "nsd_stimuli_raw.hdf5"
+_NSD_FULL_N = 73000
 
-    def _prepared_stim_ok(path: Path) -> bool:
-        """Validate prepared stimuli file; reject tiny/all-zero partial artifacts."""
-        if not path.exists():
-            return False
-        try:
-            with h5py.File(path, "r") as f:
-                if "/images" not in f:
-                    return False
-                d = f["/images"]
-                if d.shape != (n_final, 224, 224, 3):
-                    return False
-                if d.dtype != np.uint8:
-                    return False
-                # Sample a few images; reject if all are constant zeros.
-                probe_idx = [0, max(0, n_final // 2), max(0, n_final - 1)]
-                probe_sum = 0
-                for i in probe_idx:
-                    probe_sum += int(np.asarray(d[i]).sum())
-                if probe_sum == 0:
-                    return False
-        except OSError:
-            return False
-        # 1000 images at 224x224x3 should be far above a few MB; tiny file indicates partial write.
-        if path.stat().st_size < 10 * 1024 * 1024:
-            return False
-        return True
 
-    if out_path.exists():
-        if _prepared_stim_ok(out_path):
-            print(f"[5.4] Using existing {out_path}")
-            return
-        print(f"[5.4] Existing {out_path.name} appears incomplete; rebuilding it.")
-        out_path.unlink()
-
-    # If a previous extraction was interrupted (e.g., login-node kill), resume from
-    # a partial file instead of restarting from image 0.
-    resume_idx = 0
-    if part_path.exists():
-        try:
-            with h5py.File(part_path, "r") as f_part:
-                if "/images" in f_part and "/global_image_indices_73k" in f_part:
-                    dpart = f_part["/images"]
-                    gipart = f_part["/global_image_indices_73k"]
-                    if (
-                        dpart.shape == (n_final, 224, 224, 3)
-                        and dpart.dtype == np.uint8
-                        and gipart.shape == (n_final,)
-                    ):
-                        resume_idx = int(dpart.attrs.get("completed_until", 0))
-                        resume_idx = max(0, min(resume_idx, n_final))
-                        print(
-                            f"[5.4] Resuming partial extraction from image index {resume_idx}/{n_final}."
-                        )
-                    else:
-                        print(f"[5.4] Discarding incompatible partial file {part_path.name}.")
-                        part_path.unlink()
-                else:
-                    print(f"[5.4] Discarding incomplete partial file {part_path.name}.")
-                    part_path.unlink()
-        except OSError:
-            print(f"[5.4] Partial file {part_path.name} unreadable; rebuilding.")
-            part_path.unlink()
-    with h5py.File(raw_path, "r") as f_in:
-        brick = f_in["/imgBrick"]
-        shape = tuple(brick.shape)
-        print(f"[5.4] /imgBrick shape={shape}, dtype={brick.dtype}")
-        if 73000 not in shape:
-            raise RuntimeError(f"Unexpected /imgBrick shape (no 73000 axis): {shape}")
-        img_axis = int(shape.index(73000))
-
-        def _read_img(g73k: int) -> np.ndarray:
-            """Return one RGB image as (H, W, 3), regardless of axis order."""
-            idx = [slice(None)] * len(shape)
-            idx[img_axis] = int(g73k)
-            raw3 = brick[tuple(idx)]  # 3D
-            arr = np.asarray(raw3)
-            if arr.ndim != 3:
-                raise RuntimeError(
-                    f"Unexpected raw image ndim={arr.ndim} for g73k={g73k}, "
-                    f"shape={arr.shape}, brick_shape={shape}, img_axis={img_axis}"
-                )
-            if arr.shape[-1] == 3:
-                return arr
-            if arr.shape[0] == 3:
-                return np.moveaxis(arr, 0, -1)
-            if arr.shape[1] == 3:
-                return np.moveaxis(arr, 1, -1)
-            raise RuntimeError(
-                f"Could not locate channel axis (=3) for g73k={g73k}, "
-                f"raw shape={arr.shape}, brick_shape={shape}"
+def _full_stim_ok(path: Path) -> bool:
+    if not path.exists():
+        return False
+    try:
+        with h5py.File(path, "r") as f:
+            if "/images" not in f:
+                return False
+            d = f["/images"]
+            if d.shape != (_NSD_FULL_N, 224, 224, 3) or d.dtype != np.uint8:
+                return False
+            probe = sum(
+                int(np.asarray(d[i]).sum()) for i in [0, _NSD_FULL_N // 2, _NSD_FULL_N - 1]
             )
+            if probe == 0:
+                return False
+    except OSError:
+        return False
+    return path.stat().st_size > 50 * 1024 * 1024
 
-        # Default to uncompressed writes to avoid high CPU load on login nodes.
+
+def _subj_stim_ok(path: Path, n_final: int) -> bool:
+    if not path.exists():
+        return False
+    try:
+        with h5py.File(path, "r") as f:
+            if "/images" not in f or "/global_image_indices_73k" not in f:
+                return False
+            d = f["/images"]
+            if d.shape != (n_final, 224, 224, 3) or d.dtype != np.uint8:
+                return False
+            probe = sum(
+                int(np.asarray(d[i]).sum()) for i in [0, max(0, n_final // 2), n_final - 1]
+            )
+            if probe == 0:
+                return False
+    except OSError:
+        return False
+    return path.stat().st_size > 10 * 1024 * 1024
+
+
+def extract_stimuli_224(final_list: List[int], min_reps: int, n_final: int) -> None:
+    """
+    Step 1: Build (or reuse) nsd_prepared/nsd_stimuli_224_full.hdf5  — all 73k images, permanent.
+    Step 2: Build nsd_prepared/subj{AA}/nsd_stimuli_224_subj{AA}.hdf5 — subject-filtered slice.
+    Step 3: Create legacy symlink nsd_prepared/nsd_stimuli_224.hdf5 → subj file (QC compat).
+    Raw 40 GB file is deleted only after the full file is verified complete.
+    """
+    aa = RUN_SUBJECTS[0]
+    full_path = PREP / "nsd_stimuli_224_full.hdf5"
+    subj_dir = PREP / f"subj{aa:02d}"
+    subj_path = subj_dir / f"nsd_stimuli_224_subj{aa:02d}.hdf5"
+    legacy_path = PREP / "nsd_stimuli_224.hdf5"
+    part_full = PREP / "nsd_stimuli_224_full.partial.hdf5"
+    raw_path = TMP / "nsd_stimuli_raw.hdf5"
+    subj_dir.mkdir(parents=True, exist_ok=True)
+
+    # ── Step 1: full 73k file ────────────────────────────────────────────────
+    if _full_stim_ok(full_path):
+        print(f"[5.4] Full 73k stimulus file already complete: {full_path}")
+    else:
+        resume_idx = 0
+        if part_full.exists():
+            try:
+                with h5py.File(part_full, "r") as fp:
+                    if (
+                        "/images" in fp
+                        and fp["/images"].shape == (_NSD_FULL_N, 224, 224, 3)
+                        and fp["/images"].dtype == np.uint8
+                    ):
+                        resume_idx = int(fp["/images"].attrs.get("completed_until", 0))
+                        resume_idx = max(0, min(resume_idx, _NSD_FULL_N))
+                        print(f"[5.4] Resuming full build from image {resume_idx}/{_NSD_FULL_N}.")
+                    else:
+                        part_full.unlink()
+            except OSError:
+                part_full.unlink()
+
         compression_name = os.environ.get("NSD_STIM_COMPRESSION", "").strip().lower()
-        if compression_name == "gzip":
-            compression: Optional[str] = "gzip"
-            compression_opts: Optional[int] = 4
-            print("[5.4] Writing stimuli with gzip compression.")
-        else:
-            compression = None
-            compression_opts = None
-            print("[5.4] Writing stimuli without compression (login-node friendly).")
+        compression = "gzip" if compression_name == "gzip" else None
+        compression_opts = 4 if compression_name == "gzip" else None
 
-        open_mode = "r+" if part_path.exists() and resume_idx > 0 else "w"
-        with h5py.File(part_path, open_mode) as f_out:
-            if open_mode == "w":
-                d = f_out.create_dataset(
-                    "/images",
-                    shape=(n_final, 224, 224, 3),
-                    dtype=np.uint8,
-                    chunks=(1, 224, 224, 3),
-                    compression=compression,
-                    compression_opts=compression_opts,
-                )
-                d.attrs["source"] = "NSD nsd_stimuli.hdf5 /imgBrick"
-                d.attrs["resize"] = "224x224"
-                d.attrs["color_space"] = "RGB"
-                d.attrs["index_base"] = "0-based 73k IDs"
-                d.attrs["min_reps"] = min_reps
-                d.attrs["n_subjects"] = 8
-                d.attrs["n_images"] = n_final
-                d.attrs["completed_until"] = 0
-                gi = f_out.create_dataset(
-                    "/global_image_indices_73k",
-                    data=np.array(final_list, dtype=np.int32),
-                )
-                gi.attrs["index_base"] = "0-based"
-            else:
-                d = f_out["/images"]
+        with h5py.File(raw_path, "r") as f_in:
+            brick = f_in["/imgBrick"]
+            shape = tuple(brick.shape)
+            if 73000 not in shape:
+                raise RuntimeError(f"Unexpected /imgBrick shape: {shape}")
+            img_axis = shape.index(73000)
 
-            for i in range(resume_idx, n_final):
-                g73k = int(final_list[i])
-                img = _read_img(g73k)
-                im = Image.fromarray(img)
-                im = im.resize((224, 224), Image.LANCZOS)
-                d[i] = np.asarray(im, dtype=np.uint8)
-                if (i + 1) % 10 == 0 or (i + 1) == n_final:
-                    d.attrs["completed_until"] = i + 1
-                    f_out.flush()
-                    print(f"Processed {i + 1}/{n_final} images")
-        part_path.replace(out_path)
-    # verify
-    with h5py.File(out_path, "r") as f:
-        assert f["/images"].shape == (n_final, 224, 224, 3)
-        assert f["/images"].dtype == np.uint8
-        rng = np.random.default_rng(0)
-        for _ in range(10):
-            i = int(rng.integers(0, n_final))
-            assert f["/images"][i].min() >= 0 and f["/images"][i].max() <= 255
-    print(f"nsd_stimuli_224.hdf5 size: {out_path.stat().st_size / 1e9:.2f} GB")
-    if raw_path.exists():
-        os.remove(raw_path)
-        print("Removed raw stimuli HDF5 from nsd_tmp.")
+            def _to_hwc(arr: np.ndarray, idx: int) -> np.ndarray:
+                if arr.shape[-1] == 3:
+                    return arr
+                if arr.shape[0] == 3:
+                    return np.moveaxis(arr, 0, -1)
+                if arr.shape[1] == 3:
+                    return np.moveaxis(arr, 1, -1)
+                raise RuntimeError(f"Cannot find channel axis for idx={idx}, shape={arr.shape}")
+
+            def _resize(arr: np.ndarray) -> np.ndarray:
+                return np.asarray(
+                    Image.fromarray(arr).resize((224, 224), Image.LANCZOS), dtype=np.uint8
+                )
+
+            def _read_batch(indices: List[int]) -> np.ndarray:
+                idx_arr = np.asarray(indices, dtype=np.int64)
+                order = np.argsort(idx_arr)
+                sorted_i = idx_arr[order]
+                undo = np.empty_like(order)
+                undo[order] = np.arange(len(order))
+                sel = [slice(None)] * len(shape)
+                sel[img_axis] = sorted_i.tolist()
+                raw = np.moveaxis(np.asarray(brick[tuple(sel)]), img_axis, 0)[undo]
+                return np.stack([_to_hwc(raw[i], indices[i]) for i in range(len(indices))])
+
+            open_mode = "r+" if part_full.exists() and resume_idx > 0 else "w"
+            CHUNK = 256
+            resize_workers = min(16, max(1, os.cpu_count() or 4))
+
+            with h5py.File(part_full, open_mode) as f_out:
+                if open_mode == "w":
+                    d = f_out.create_dataset(
+                        "/images",
+                        shape=(_NSD_FULL_N, 224, 224, 3),
+                        dtype=np.uint8,
+                        chunks=(1, 224, 224, 3),
+                        compression=compression,
+                        compression_opts=compression_opts,
+                    )
+                    d.attrs["source"] = "NSD nsd_stimuli.hdf5 /imgBrick"
+                    d.attrs["resize"] = "224x224"
+                    d.attrs["color_space"] = "RGB"
+                    d.attrs["index_base"] = "0-based 73k IDs"
+                    d.attrs["n_images"] = _NSD_FULL_N
+                    d.attrs["completed_until"] = 0
+                    f_out.create_dataset(
+                        "/global_image_indices_73k",
+                        data=np.arange(_NSD_FULL_N, dtype=np.int32),
+                    ).attrs["index_base"] = "0-based"
+                else:
+                    d = f_out["/images"]
+
+                with concurrent.futures.ThreadPoolExecutor(max_workers=resize_workers) as pool:
+                    for i0 in range(resume_idx, _NSD_FULL_N, CHUNK):
+                        i1 = min(i0 + CHUNK, _NSD_FULL_N)
+                        raw_batch = _read_batch(list(range(i0, i1)))
+                        resized = np.stack(list(pool.map(_resize, raw_batch)))
+                        d[i0:i1] = resized
+                        d.attrs["completed_until"] = i1
+                        f_out.flush()
+                        print(f"[5.4] Full build: {i1}/{_NSD_FULL_N} images")
+
+        part_full.replace(full_path)
+        if not _full_stim_ok(full_path):
+            raise RuntimeError("Full 73k stimulus file failed validation after build.")
+        print(f"[5.4] Full stimulus file written: {full_path.stat().st_size / 1e9:.2f} GB")
+        if raw_path.exists():
+            os.remove(raw_path)
+            print("[5.4] Removed raw 40 GB stimulus HDF5 — full file is now permanent.")
+
+    # ── Step 2: per-subject filtered file ────────────────────────────────────
+    if _subj_stim_ok(subj_path, n_final):
+        print(f"[5.4] Per-subject stimulus file already complete: {subj_path}")
+    else:
+        if subj_path.exists():
+            subj_path.unlink()
+        print(f"[5.4] Writing per-subject file ({n_final} images) → {subj_path.name} ...")
+        CHUNK = 256
+        with h5py.File(full_path, "r") as f_full, h5py.File(subj_path, "w") as f_out:
+            d_in = f_full["/images"]
+            d_out = f_out.create_dataset(
+                "/images",
+                shape=(n_final, 224, 224, 3),
+                dtype=np.uint8,
+                chunks=(1, 224, 224, 3),
+            )
+            d_out.attrs["source"] = str(full_path)
+            d_out.attrs["resize"] = "224x224"
+            d_out.attrs["color_space"] = "RGB"
+            d_out.attrs["index_base"] = "0-based 73k IDs"
+            d_out.attrs["min_reps"] = min_reps
+            d_out.attrs["n_images"] = n_final
+            gi = f_out.create_dataset(
+                "/global_image_indices_73k",
+                data=np.array(final_list, dtype=np.int32),
+            )
+            gi.attrs["index_base"] = "0-based"
+            for start in range(0, n_final, CHUNK):
+                end = min(start + CHUNK, n_final)
+                src_idx = final_list[start:end]
+                order = np.argsort(src_idx)
+                sorted_src = np.asarray(src_idx)[order]
+                undo = np.empty_like(order)
+                undo[order] = np.arange(len(order))
+                d_out[start:end] = np.asarray(d_in[sorted_src.tolist()])[undo]
+                print(f"[5.4] Subject filter: {end}/{n_final}")
+        if not _subj_stim_ok(subj_path, n_final):
+            raise RuntimeError(f"Per-subject stimulus file failed validation: {subj_path}")
+        print(f"[5.4] Per-subject file written: {subj_path.stat().st_size / 1e9:.2f} GB")
+
+    # ── Step 3: legacy symlink so all existing QC code works unchanged ────────
+    if legacy_path.is_symlink() or legacy_path.exists():
+        legacy_path.unlink()
+    legacy_path.symlink_to(subj_path.resolve())
+    print(f"[5.4] {legacy_path.name} → {subj_path.name} (symlink for QC compatibility)")
 
 
 # =============================================================================
@@ -1297,14 +1361,7 @@ def load_repeat_counter_from_h5(
     roi = ROI_ORDER[0]
     with h5py.File(paths[roi], "r") as f:
         b = f["/betas"][:]
-    ctr = np.zeros(n_final, dtype=np.int32)
-    for i in range(n_final):
-        filled = 0
-        for r in range(min_reps):
-            if np.all(np.isnan(b[i, r, :])):
-                break
-            filled += 1
-        ctr[i] = filled
+    ctr = (~np.isnan(b)).all(axis=2).sum(axis=1).astype(np.int32)
     return ctr
 
 
@@ -1329,28 +1386,28 @@ def process_subject_sessions(
         )
 
     failed: List[int] = []
+    fds = {roi: h5py.File(out_paths[roi], "r+") for roi in ROI_ORDER}
+    roi_write_pool = concurrent.futures.ThreadPoolExecutor(max_workers=len(ROI_ORDER))
 
-    def run_session(BB: int) -> None:
-        nonlocal repeat_counter
-        if int(np.sum(repeat_counter >= min_reps)) == n_final:
-            print(f"[subj{aa:02d}] All images complete. Skipping session {BB}.")
-            return
+    def _prepare_session_file(BB: int) -> Tuple[Path, bool]:
         check_disk_space(4.0)
         src = (
             f"{S3_BUCKET}/nsddata_betas/ppdata/subj{aa:02d}/"
             f"func1pt8mm/betas_fithrf/betas_session{BB:02d}.hdf5"
         )
         cache_file = BETA_CACHE / f"subj{aa:02d}" / f"betas_session{BB:02d}.hdf5"
-        tmp = TMP / "betas_tmp.hdf5"
-        session_file = cache_file if cache_file.exists() else tmp
-        try:
-            if not cache_file.exists():
-                if tmp.exists():
-                    tmp.unlink()
-                aws_s3_cp(src, tmp)
-        except Exception as e:
-            log_error(f"subj{aa:02d} session {BB} download", e)
-            failed.append(BB)
+        if cache_file.exists():
+            return cache_file, False
+        tmp_file = TMP / f"betas_tmp_subj{aa:02d}_session{BB:02d}.hdf5"
+        if tmp_file.exists():
+            tmp_file.unlink()
+        aws_s3_cp(src, tmp_file)
+        return tmp_file, True
+
+    def run_session(BB: int, session_file: Path, remove_after: bool) -> None:
+        nonlocal repeat_counter
+        if int(np.sum(repeat_counter >= min_reps)) == n_final:
+            print(f"[subj{aa:02d}] All images complete. Skipping session {BB}.")
             return
 
         def _align_mask(mask_xyz: np.ndarray, target_shape: Tuple[int, int, int]) -> np.ndarray:
@@ -1396,45 +1453,80 @@ def process_subject_sessions(
                 g73k = int(subject_73k_ids[aa][local_10k])
                 final_pos_by_trial.append(final_set_pos.get(g73k))
 
-            def _read_trial_float32(trial_idx: int) -> np.ndarray:
+            def _read_trials_block(i0: int, i1: int) -> np.ndarray:
                 sel: List[Any] = [slice(None)] * 4
-                sel[t_ax] = trial_idx
-                vol = np.asarray(dset[tuple(sel)], dtype=np.float32) / 300.0
-                if tuple(vol.shape) != spatial_shape:
+                sel[t_ax] = slice(i0, i1)
+                arr = np.asarray(dset[tuple(sel)], dtype=np.float32) / 300.0
+                arr = np.moveaxis(arr, t_ax, 0)
+                exp_shape = (i1 - i0,) + spatial_shape
+                if tuple(arr.shape) != exp_shape:
                     raise RuntimeError(
-                        f"Unexpected beta trial shape {vol.shape}; expected {spatial_shape}."
+                        f"Unexpected beta block shape {arr.shape}; expected {exp_shape}."
                     )
-                return vol
+                return arr
 
-            fds = {
-                roi: h5py.File(out_paths[roi], "r+") for roi in ROI_ORDER
-            }
-            try:
-                n_write = 0
-                for t in range(750):
-                    fp = final_pos_by_trial[t]
-                    if fp is None:
+            fp_by_trial = np.full(750, -1, dtype=np.int32)
+            for t, fp in enumerate(final_pos_by_trial):
+                if fp is not None:
+                    fp_by_trial[t] = int(fp)
+            slot_by_trial = np.full(750, -1, dtype=np.int32)
+            n_write = 0
+            for t in range(750):
+                fp = int(fp_by_trial[t])
+                if fp < 0:
+                    continue
+                rs = int(repeat_counter[fp])
+                if rs >= min_reps:
+                    continue
+                slot_by_trial[t] = rs
+                repeat_counter[fp] = rs + 1
+                n_write += 1
+
+            if n_write > 0:
+                fp_chunks: List[np.ndarray] = []
+                slot_chunks: List[np.ndarray] = []
+                roi_chunks: Dict[str, List[np.ndarray]] = {roi: [] for roi in ROI_ORDER}
+                beta_batch = 100
+                for i0 in range(0, 750, beta_batch):
+                    i1 = min(i0 + beta_batch, 750)
+                    keep_local = np.where(slot_by_trial[i0:i1] >= 0)[0]
+                    if keep_local.size == 0:
                         continue
-                    rs = int(repeat_counter[fp])
-                    if rs >= min_reps:
-                        continue
-                    flat = _read_trial_float32(t).ravel(order="C")
+                    block = _read_trials_block(i0, i1).reshape(i1 - i0, -1)
+                    block_keep = block[keep_local]
+                    fp_chunks.append(fp_by_trial[i0:i1][keep_local])
+                    slot_chunks.append(slot_by_trial[i0:i1][keep_local])
                     for roi in ROI_ORDER:
-                        vec = flat[roi_lin_idx[roi]]
-                        fds[roi]["/betas"][fp, rs, :] = vec.astype(np.float32, copy=False)
-                    repeat_counter[fp] += 1
-                    n_write += 1
-                    if n_write % 50 == 0:
-                        n_done_mid = int(np.sum(repeat_counter >= min_reps))
-                        print(
-                            f"[subj{aa:02d}] Session {BB:02d}: wrote {n_write} target trials | "
-                            f"images complete {n_done_mid}/{n_final}"
+                        roi_chunks[roi].append(
+                            block_keep[:, roi_lin_idx[roi]].astype(np.float32, copy=False)
                         )
-            finally:
-                for f in fds.values():
-                    f.close()
-        if session_file == tmp and tmp.exists():
-            os.remove(tmp)
+
+                fp_rows = np.concatenate(fp_chunks, axis=0)
+                slot_rows = np.concatenate(slot_chunks, axis=0)
+
+                def _write_roi_batches(roi: str) -> None:
+                    d_roi = fds[roi]["/betas"]
+                    vecs = np.concatenate(roi_chunks[roi], axis=0)
+                    for rs in range(min_reps):
+                        m = slot_rows == rs
+                        if not np.any(m):
+                            continue
+                        fp_sel = fp_rows[m].astype(np.int64, copy=False)
+                        vec_sel = vecs[m]
+                        ord_idx = np.argsort(fp_sel)
+                        fp_sel = fp_sel[ord_idx]
+                        vec_sel = vec_sel[ord_idx]
+                        d_roi[fp_sel, rs, :] = vec_sel
+
+                list(roi_write_pool.map(_write_roi_batches, ROI_ORDER))
+                n_done_mid = int(np.sum(repeat_counter >= min_reps))
+                print(
+                    f"[subj{aa:02d}] Session {BB:02d}: wrote {n_write} target trials | "
+                    f"images complete {n_done_mid}/{n_final}"
+                )
+
+        if remove_after and session_file.exists():
+            os.remove(session_file)
         n_done = int(np.sum(repeat_counter >= min_reps))
         free = shutil.disk_usage(".").free / 1e9
         print(
@@ -1442,17 +1534,57 @@ def process_subject_sessions(
             f"Images fully filled: {n_done}/{n_final} | Free disk: {free:.1f} GB"
         )
 
-    for BB in session_list:
+    try:
+        prefetch_q: "queue.Queue[Optional[Tuple[int, Optional[Path], bool, Optional[BaseException]]]]" = queue.Queue(
+            maxsize=2
+        )
+        stop_event = threading.Event()
+
+        def _prefetch_worker() -> None:
+            try:
+                for BB in session_list:
+                    if stop_event.is_set():
+                        break
+                    try:
+                        session_file, remove_after = _prepare_session_file(BB)
+                        prefetch_q.put((BB, session_file, remove_after, None))
+                    except Exception as e:
+                        prefetch_q.put((BB, None, False, e))
+            finally:
+                prefetch_q.put(None)
+
+        prefetch_thread = threading.Thread(target=_prefetch_worker, daemon=True)
+        prefetch_thread.start()
+
         try:
-            run_session(BB)
-        except Exception as e:
-            log_error(f"subj{aa:02d} session {BB} process", e)
-            failed.append(BB)
-    for BB in list(failed):
-        try:
-            run_session(BB)
-        except Exception as e:
-            log_error(f"subj{aa:02d} session {BB} retry", e)
+            while True:
+                item = prefetch_q.get()
+                if item is None:
+                    break
+                BB, session_file, remove_after, dl_err = item
+                if dl_err is not None or session_file is None:
+                    log_error(f"subj{aa:02d} session {BB} download", dl_err)
+                    failed.append(BB)
+                    continue
+                try:
+                    run_session(BB, session_file, remove_after)
+                except Exception as e:
+                    log_error(f"subj{aa:02d} session {BB} process", e)
+                    failed.append(BB)
+        finally:
+            stop_event.set()
+            prefetch_thread.join()
+
+        for BB in list(set(failed)):
+            try:
+                session_file, remove_after = _prepare_session_file(BB)
+                run_session(BB, session_file, remove_after)
+            except Exception as e:
+                log_error(f"subj{aa:02d} session {BB} retry", e)
+    finally:
+        roi_write_pool.shutdown(wait=True)
+        for f in fds.values():
+            f.close()
 
 
 def prefetch_all_beta_sessions() -> None:
@@ -2078,6 +2210,19 @@ def validate_outputs(
             if f["/images"].shape[0] != n_final:
                 print("WARNING: stimuli shape mismatch")
                 ok = False
+    full_stim = PREP / "nsd_stimuli_224_full.hdf5"
+    if full_stim.exists():
+        with h5py.File(full_stim, "r") as f:
+            if f["/images"].shape != (73000, 224, 224, 3):
+                print("WARNING: full stimulus shape mismatch")
+                ok = False
+    aa = RUN_SUBJECTS[0]
+    subj_stim = PREP / f"subj{aa:02d}" / f"nsd_stimuli_224_subj{aa:02d}.hdf5"
+    if subj_stim.exists():
+        with h5py.File(subj_stim, "r") as f:
+            if f["/images"].shape[0] != n_final:
+                print("WARNING: per-subject stimulus shape mismatch")
+                ok = False
     for aa in RUN_SUBJECTS:
         for roi in ROI_ORDER:
             p = PREP / f"subj{aa:02d}" / f"nsd_neural_{roi}.hdf5"
@@ -2145,6 +2290,8 @@ def write_metadata(
         },
         "output_files": {
             "stimuli": "nsd_prepared/nsd_stimuli_224.hdf5",
+            "stimuli_full_73k": "nsd_prepared/nsd_stimuli_224_full.hdf5",
+            "stimuli_subject_filtered": "nsd_prepared/subj{AA}/nsd_stimuli_224_subj{AA}.hdf5",
             "neural_arrays": "nsd_prepared/subj{AA}/nsd_neural_{ROI}.hdf5",
             "final_image_set": "nsd_prepared/final_image_set.npz",
             "noise_ceiling": "nsd_prepared/noise_ceiling_data.npz",
@@ -2295,6 +2442,7 @@ def main() -> None:
     assert_csv_agreement(rep_count, stim_df, subject_73k_ids, rng)
     n_overlap, overlap_sets = overlap_analysis(rep_count, subject_73k_ids)
     print_overlap_table(rep_count, subject_73k_ids, n_overlap)
+    print_image_counts_per_subject(rep_count)
     shared_73k = set(int(x - 1) for x in sharedix.tolist())
     in_o3 = len(shared_73k & overlap_sets[3])
     print(
