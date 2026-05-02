@@ -1055,7 +1055,9 @@ def _subj_stim_ok(path: Path, n_final: int) -> bool:
     return path.stat().st_size > 10 * 1024 * 1024
 
 
-def extract_stimuli_224(final_list: List[int], min_reps: int, n_final: int) -> None:
+def extract_stimuli_224(
+    final_list: List[int], min_reps: int, n_final: int, overwrite_existing: bool = False
+) -> None:
     """
     Step 1: Build (or reuse) nsd_prepared/nsd_stimuli_224_full.hdf5  — all 73k images, permanent.
     Step 2: Build nsd_prepared/subj{AA}/nsd_stimuli_224_subj{AA}.hdf5 — subject-filtered slice.
@@ -1070,6 +1072,12 @@ def extract_stimuli_224(final_list: List[int], min_reps: int, n_final: int) -> N
     part_full = PREP / "nsd_stimuli_224_full.partial.hdf5"
     raw_path = TMP / "nsd_stimuli_raw.hdf5"
     subj_dir.mkdir(parents=True, exist_ok=True)
+
+    if overwrite_existing:
+        print("[5.4] --overwrite-stimuli enabled: rebuilding full and subject stimulus files.")
+        for p in (part_full, full_path, subj_path, legacy_path):
+            if p.exists() or p.is_symlink():
+                p.unlink()
 
     # ── Step 1: full 73k file ────────────────────────────────────────────────
     if _full_stim_ok(full_path):
@@ -2381,6 +2389,12 @@ def parse_args() -> argparse.Namespace:
         help="Subject(s) to process for non-interactive mode (e.g., 'subj01'). "
         "Interactive mode prompts for one subject at runtime.",
     )
+    p.add_argument(
+        "--overwrite-stimuli",
+        action="store_true",
+        help="Force rebuild of stimulus outputs for selected subject: "
+        "nsd_stimuli_224_full.hdf5, subjXX/nsd_stimuli_224_subjXX.hdf5, and legacy symlink.",
+    )
     return p.parse_args()
 
 
@@ -2540,11 +2554,21 @@ def main() -> None:
     # Part 5
     print_part_disk("Part 5")
     stim_raw = TMP / "nsd_stimuli_raw.hdf5"
+    full_stim = PREP / "nsd_stimuli_224_full.hdf5"
+    aa_sel = int(RUN_SUBJECTS[0])
+    subj_stim = PREP / f"subj{aa_sel:02d}" / f"nsd_stimuli_224_subj{aa_sel:02d}.hdf5"
     stim_out = PREP / "nsd_stimuli_224.hdf5"
-    need_stim = True
-    if stim_out.exists():
-        with h5py.File(stim_out, "r") as sf:
-            need_stim = sf["/images"].shape[0] != n_final
+    need_stim = bool(args.overwrite_stimuli)
+    if not need_stim:
+        need_stim = not _full_stim_ok(full_stim)
+    if not need_stim:
+        need_stim = not _subj_stim_ok(subj_stim, n_final)
+    if not need_stim:
+        if stim_out.exists():
+            with h5py.File(stim_out, "r") as sf:
+                need_stim = sf["/images"].shape[0] != n_final
+        else:
+            need_stim = True
     if need_stim:
         if not _recover_complete_stimulus_file(stim_raw):
             download_stimuli_progress(
@@ -2555,7 +2579,12 @@ def main() -> None:
             print(
                 f"[5.3] Found existing complete stimulus file at {stim_raw}; skipping download."
             )
-        extract_stimuli_224(final_list, min_reps, n_final)
+        extract_stimuli_224(
+            final_list,
+            min_reps,
+            n_final,
+            overwrite_existing=bool(args.overwrite_stimuli),
+        )
 
     # Part 6
     print_part_disk("Part 6")

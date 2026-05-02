@@ -16,7 +16,7 @@ A single Python script that downloads and prepares **[Natural Scenes Dataset (NS
    Uses NSD **func1pt8mm** ROI atlases (default: **V1/V2/V4** from `prf-visualrois`; **IT** inferred from `streams.mgz.ctab` labels, with fallbacks). You can confirm or override mappings interactively, or use **`--non-interactive`** to keep defaults.
 
 3. **Stimuli**  
-   Downloads **`nsd_stimuli.hdf5`** (~40 GB), extracts **`/imgBrick`** for the **final image set only**, resizes to **224×224 RGB** (`uint8`), writes **`nsd_prepared/nsd_stimuli_224.hdf5`**, then deletes the raw full brick when extraction succeeds.
+   Downloads **`nsd_stimuli.hdf5`** (~40 GB), builds and keeps a permanent **full 73k** resized file **`nsd_prepared/nsd_stimuli_224_full.hdf5`**, writes per-subject filtered stimuli **`nsd_prepared/subjXX/nsd_stimuli_224_subjXX.hdf5`**, and maintains legacy path **`nsd_prepared/nsd_stimuli_224.hdf5`** as a symlink for QC compatibility.
 
 4. **Neural betas**  
    For each subject, downloads **`betas_fithrf`** session HDF5s (`betas_sessionXX.hdf5`), converts **`int16 / 300`** → **float32** (percent signal change), and fills **per-ROI** arrays **`(N_FINAL, MIN_REPS, n_voxels)`** with **NaN** for missing slots. Sessions are processed **sequentially**; temporary session files are deleted after each session.
@@ -36,7 +36,9 @@ After a full successful run (exact sizes depend on **`N_FINAL`** and ROI voxel c
 | Path | Description |
 |------|-------------|
 | `final_image_set.npz` | Final 73k IDs, `MIN_REPS`, per-subject local indices into each 10k set |
-| `nsd_stimuli_224.hdf5` | `/images` `(N_FINAL, 224, 224, 3)` uint8; `/global_image_indices_73k` |
+| `nsd_stimuli_224_full.hdf5` | `/images` `(73000, 224, 224, 3)` uint8; permanent full stimulus bank |
+| `subjXX/nsd_stimuli_224_subjXX.hdf5` | `/images` `(N_FINAL, 224, 224, 3)` uint8 for selected subject |
+| `nsd_stimuli_224.hdf5` | Symlink to current subject filtered stimulus file (legacy QC path) |
 | `subjXX/nsd_neural_V1.hdf5` (and V2, V4, IT) | `/betas` float32, shape `(N_FINAL, MIN_REPS, n_voxels)` |
 | `noise_ceiling_data.npz` | Per-subject/ROI noise-ceiling distributions and means |
 | `metadata.json` | Full provenance and settings |
@@ -79,12 +81,16 @@ Required/important flags:
 - `--non-interactive` / `-y`: skip prompts and use defaults.
 - `--subjects subj0X`: choose the single subject to process.
 - `--smoke-test`: run Parts 0–4 only (no large downloads).
+- `--overwrite-stimuli`: force rebuild of full+subject stimulus HDF5 outputs.
 
 Examples:
 
 ```bash
 # Full run for one subject (default MIN_REPS=3, default ROIs)
 python nsd_prepare_pipeline.py -y --subjects subj01
+
+# Force rebuild of full 73k and subject stimuli outputs
+python nsd_prepare_pipeline.py -y --subjects subj01 --overwrite-stimuli
 
 # Quick validation run (no large downloads)
 python nsd_prepare_pipeline.py -y --subjects subj01 --smoke-test
@@ -174,6 +180,15 @@ git push -u origin main
 Use **SSH** if you prefer: `git@github.com:YOUR_USERNAME/YOUR_REPO.git`.
 
 3. **Never commit** `nsd_prepared/` or `nsd_tmp/` — they are listed in **`.gitignore`** and can be **tens to hundreds of GB**.
+
+### Commit and push updates to this repo
+
+```bash
+git status
+git add nsd_prepare_pipeline.py README.md
+git commit -m "Update stimuli overwrite controls and README instructions"
+git push
+```
 
 ---
 
