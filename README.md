@@ -136,6 +136,55 @@ python nsd_prepare_pipeline.py -y
 
 ---
 
+## Official NSD ncsnr masks
+
+If you want to threshold voxels using the **official NSD `ncsnr`** maps (rather than a proxy from prepared betas), use:
+
+```bash
+python build_nsd_ncsnr_masks.py \
+  --prepared-dir nsd_prepared \
+  --subjects subj01 \
+  --outdir nsd_ncsnr_masks \
+  --threshold-nc-pct 20 \
+  --min-reps 3 \
+  --perm 0,1,2
+```
+
+Notes:
+- This script downloads `ncsnr.nii.gz` and required ROI atlas files from NSD public S3.
+- It reads `nsd_prepared/metadata.json` to use the same ROI atlas+labels as your pipeline run.
+- It validates output vector length against `nsd_prepared/subjXX/nsd_neural_{ROI}.hdf5` axis-2 size.
+- If you hit a shape mismatch, try `--perm 2,1,0`.
+
+Outputs per subject+ROI include:
+- `subjXX_{ROI}_ncsnr.npy` (raw ncsnr vector)
+- `subjXX_{ROI}_nc_pct.npy` (converted NC%)
+- `subjXX_{ROI}_mask_nc_pct_ge_20.npy` (if threshold provided)
+
+### Apply a saved mask to `nsd_neural_*`
+
+Example for one subject/ROI:
+
+```python
+import h5py
+import numpy as np
+
+roi = "V1"
+sub = "subj01"
+neural_path = f"nsd_prepared/{sub}/nsd_neural_{roi}.hdf5"
+mask_path = f"nsd_ncsnr_masks/{sub}/{sub}_{roi}_mask_nc_pct_ge_20.npy"
+
+with h5py.File(neural_path, "r") as f:
+    b = f["/betas"][:]  # shape: (n_images, min_reps, n_voxels)
+mask = np.load(mask_path).astype(bool)
+assert mask.shape[0] == b.shape[2], (mask.shape, b.shape)
+
+b_masked = b[:, :, mask]  # filtered voxel axis
+print("masked shape:", b_masked.shape)
+```
+
+---
+
 ## Resuming and failures
 
 - The script **skips** steps whose outputs already exist with the **expected shapes** (e.g. existing `nsd_stimuli_224.hdf5`, neural HDF5s).
